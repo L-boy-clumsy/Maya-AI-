@@ -594,7 +594,10 @@ class AIClient:
         except json.JSONDecodeError as exc:
             raise AssistantError("API 返回不是有效 JSON：%s" % raw[:1500]) from exc
 
-    def generate_plan(self, user_text: str, attachments: Sequence[Attachment]) -> Dict[str, Any]:
+    def generate_plan(self, user_text: str, attachments: Sequence[Attachment],
+                      scene_context: str) -> Dict[str, Any]:
+        # scene_context 由调用方在主线程采集后传入。本方法在 QThread 里执行，
+        # 而 Maya 命令只允许在主线程调用（见 GenerateWorker 的说明）。
         if not self.model:
             raise AssistantError("Model 不能为空。")
         context_text, images = attachment_context(attachments)
@@ -602,7 +605,7 @@ class AIClient:
             "USER REQUEST:\n%s\n\n"
             "CURRENT MAYA SCENE CONTEXT:\n%s\n\n"
             "ATTACHMENTS / LOCAL ASSETS:\n%s"
-        ) % (user_text.strip(), _scene_context(), context_text or "(none)")
+        ) % (user_text.strip(), scene_context, context_text or "(none)")
 
         if self.api_type == "OpenAI Responses":
             return self._generate_responses(user_payload, images)
@@ -681,16 +684,22 @@ class GenerateWorker(QtCore.QObject):
     finished = QtCore.Signal(object)
     failed = QtCore.Signal(str)
 
-    def __init__(self, client: AIClient, user_text: str, attachments: Sequence[Attachment]):
+    def __init__(self, client: AIClient, user_text: str, attachments: Sequence[Attachment],
+                 scene_context: str):
         super().__init__()
         self.client = client
         self.user_text = user_text
         self.attachments = list(attachments)
+        self.scene_context = scene_context
 
     @QtCore.Slot()
     def run(self):
+        # 本方法运行在 QThread 里。Maya 只允许在主线程调用 cmds.*，
+        # 从工作线程调用会被拒绝，并抛出与本意无关的误导性错误
+        # （例如「必须为标志 "selection" 传递一个布尔参数」）。
+        # 所以场景上下文已由主线程采集好，这里只做纯网络 / 文件工作。
         try:
-            plan = self.client.generate_plan(self.user_text, self.attachments)
+            plan = self.client.generate_plan(self.user_text, self.attachments, self.scene_context)
             self.finished.emit(plan)
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -1767,6 +1776,15 @@ class MayaAIAssistantWindow(QtWidgets.QDialog):
         except Exception as exc:
             self.status.setText(str(exc))
             return
+
+        # 场景上下文必须在主线程采集：Maya 只允许在主线程调用 cmds.*，
+        # 放到下面的工作线程里会被拒绝并抛出误导性错误（详见 GenerateWorker.run）。
+        try:
+            scene_context = _scene_context()
+        except Exception as exc:
+            self.status.setText("读取场景上下文失败：%s" % exc)
+            return
+
         self._save_settings()
         self._set_busy(True)
         self.status.setText("正在请求 AI 生成受控计划……")
@@ -1776,7 +1794,7 @@ class MayaAIAssistantWindow(QtWidgets.QDialog):
 
         client = AIClient(self.api_type.currentText(), base_url, model, api_key)
         thread = QtCore.QThread(self)
-        worker = GenerateWorker(client, text, list(self._attachments))
+        worker = GenerateWorker(client, text, list(self._attachments), scene_context)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_plan_ready)
